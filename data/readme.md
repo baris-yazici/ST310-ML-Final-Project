@@ -1,0 +1,3 @@
+- This folder contains the training data for the project. 
+- 81 features extracted from 21263 superconductors along with the critical temperature in the 82nd column. 
+- The link to the dataset: https://archive.ics.uci.edu/dataset/464/superconductivty+data
