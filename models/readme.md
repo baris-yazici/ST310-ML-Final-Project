@@ -1,1 +1,1 @@
-This folder contains the models for the project.
+This folder contains the models we developed for the project.
