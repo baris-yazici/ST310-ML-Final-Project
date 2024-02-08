@@ -3,3 +3,5 @@
 - The link to the dataset: https://archive.ics.uci.edu/dataset/464/superconductivty+data
 
 - The final data used to train the models is the subsampled version of the superconduct_train.csv data is subsampled_superconduct.csv, which has n = 1000. We did the subsampling to meet the project requirements.
+
+- Subsample_Data.R is the subsampling code used to subsample the train data.
