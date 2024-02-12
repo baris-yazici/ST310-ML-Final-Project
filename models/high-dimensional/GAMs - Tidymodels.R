@@ -49,4 +49,4 @@ fit_gam <- mod_gam %>%
 pred_gam <- unlist(predict(fit_gam, new_data = data_test))
 
 # calculate the test error
-gam_rmse <- rmse(data_test[, 82], pred_gam)
+gam_test <- rmse(data_test[, 82], pred_gam)
