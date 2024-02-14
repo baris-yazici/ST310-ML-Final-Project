@@ -61,20 +61,22 @@ gradient_descent_ridge = function(X, y, lambda, stop_threshold, learning_rate, m
   return(beta_est)
 }
 
-# Fitting the Model
+# Fitting the model
+
+## Loading the data
 file_path = "~/Desktop/R/ST 310/Summative/Final Project/"
 dataset = read.csv(paste0(file_path, "subsampled_superconduct.csv"))
 X = dataset %>% dplyr::select(-critical_temp) %>% as.matrix() %>% scale() # normalize X
 y = dataset$critical_temp %>% as.matrix()
 
-# Set hyperparameters
+## Set hyperparameters
 lambda = 0.0001
 stop_threshold = 0.001
 learning_rate = 0.01
 max_iterations = 10000
 
-# Fit the model
+## Fit the model and get the estimates for beta
 beta_ridge = gradient_descent_ridge(X_normalized, y, lambda, stop_threshold, learning_rate, max_iterations)
 
-# Print the coefficients
+## Print the coefficients
 print(beta_ridge)
