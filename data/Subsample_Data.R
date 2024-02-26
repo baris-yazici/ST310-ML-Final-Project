@@ -3,7 +3,7 @@ install.packages("dplyr")
 library(dplyr)
 
 # Subsample n observations from the dataset
-n = 1000
+n = 500
 subsample = superconduct_train %>% sample_n(n)
 
 # Export as a csv
