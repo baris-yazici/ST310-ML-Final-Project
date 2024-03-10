@@ -1,0 +1,611 @@
+---
+title: "ST 310 Final Project"
+author: 'Candidate Numbers: 24788, 32671, 21840'
+date: "2024-03-04"
+output: html_document
+---
+
+```{r setup1, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+
+# Load required packages
+library(randomForest) # Needed to fit RF when we set the engine 
+library(tidymodels) # We use Tidymodels workflow in fitting models
+library(xgboost)
+library(caret)
+library(glmnet) # For Lasso
+library(dbarts)
+library(LiblineaR)
+library(mgcv)
+library(tidyclust)
+library(dplyr) # We use it with subsampling and gradient descent implementation
+library(stringr)
+library(broom)
+library(tree) # Used to fit the final tree model
+library(rpart.plot) # Used to plot the final tree
+library(gamsel) # Used to fit penalized GAMs
+
+theme_set(theme_minimal())
+```
+
+
+```{r setup2}
+set.seed(24788) # We set a seed for replicability purposes.
+```
+
+# Load Data
+
+```{r}
+file_path = "~/Desktop/R/ST 310/Summative/Final Project/"
+dataset = read.csv(paste0(file_path, "subsampled_superconduct.csv"))
+```
+
+# Introduction
+
+Throughout this report, we work with the superconductivity dataset, which can be downloaded from: https://archive.ics.uci.edu/dataset/464/superconductivty+data. The dataset contains 81 features of 21263 superconductors along with their critical temperature. The goal is to predict the critical temperature. We will fit five different models to the data set and discuss the relative advantages and disadvantages of each model, as well as the choices we made when fitting the models. Our goal is not necessarily to find the model with best predictive accuracy but to explore different models that are suitable for different scenarios.
+
+Please note that even though the original data has a sample size of 21263, we subsample it to obtain a sample size of 500 in order to meet the requirements of the projects, such as fitting a high dimensional model and fitting models that are computationally complex.
+
+To streamline the model fitting process, we use Tidymodels workflow where possible. We first define the data splitting rules, cross validation, and the recipe for our data. This ensures that the training and test sets are the same in every model, as well as the folds used for cross validation.
+
+# Tidymodels Workflow
+
+```{r}
+# Set up data splitting rules and the recipe
+data_split = initial_split(dataset)
+data_train = training(data_split)
+data_test = testing(data_split)
+
+# Set up the cross validation rule
+data_cv = vfold_cv(data_train, v = 10) # 10-fold cross-validation
+
+# Set up the recipe to use with different models
+data_recipe = data_train %>%
+  recipe(critical_temp ~ .) %>%
+  prep()
+```
+
+
+# Simple Model
+
+We first fit a linear model in order to have a baseline for comparison and interpretation. As we have 81 features in our data, we use Lasso regression and do variable selection and estimation simultaneously to end up with a model that is as simple as possible.
+
+## Fitting a Lasso Model
+
+Fitting a Lasso model involves choosing a lambda to control shrinkage. Normally, a tuning grid of lambda values would be set and the best one would be chosen with cross validation to minimize validation error; however, using cross validation yields a lambda of 0.033598, resulting in a 20-predictor final model, which is not as simple as we want as a baseline. So, we intentionally set lambda to 8 in order to shrink most of the coefficients to 0 and end up with a baseline model that has 4 predictors.
+
+```{r}
+# We set a high lambda 
+high_lambda = 8
+
+# Creating the lasso model object
+## linear_reg creates the linear regression model with regularization
+mod_lasso = linear_reg(penalty = high_lambda, 
+                       mixture = 1) %>% # mixture = 1 specifies lasso
+                       set_engine("glmnet")
+
+# Setting up the recipe for lasso
+regularized_recipe = data_train %>%
+  recipe(critical_temp ~ .) %>% # critical_temp is our outcome
+  step_normalize(all_predictors()) %>% # normalize predictors
+  prep() # prepare the recipe so it can be used in the model workflow
+
+# Specifying the workflow for training
+lasso_workflow = workflow() %>% 
+  add_model(mod_lasso) %>% 
+  add_recipe(regularized_recipe)
+  
+# Fitting the lasso model using the workflow
+lasso_fit = lasso_workflow %>% 
+  fit(data_train) 
+
+# Extracting and organizing the coefficients from the model using tidy()
+coefficients_df <- tidy(lasso_fit, number = 1)
+```
+
+## Coefficients
+
+After fitting the model, we plot the coefficients. We see that the model contains 4 non-zero coefficients.
+
+```{r}
+## The model highlights when coefficient becomes zero and labels the coefficients
+plot(coefficients_df$estimate, xlab = "Coefficient Index", ylab = "Coefficient Value", main = "Lasso Model Coefficients")
+abline(h = 0, col = "gray", lty = 2)
+text(seq_along(coefficients_df$estimate), coefficients_df$estimate, labels = coefficients_df$term, pos = 3, cex = 0.8)
+```
+
+## Final Lasso Model
+
+```{r}
+# Printing the final model with non-zero coefficients
+coefficients_df %>% 
+  filter(estimate != 0) %>% # this filters out zero coefficients
+  select(c(term, estimate)) %>% 
+  print()
+```
+
+We see that the final model only has wtd_entropy_atomic_mass, range_atomic_radius, wtd_std_ThermalConductivity, and wtd_mean_Valence as predictors. Lasso model is easy to interpret, as the interpretation is the same as a multiple linear regression model. For example, we see that a one unit increase in wtd_entropy_atomic_mass is associated on average with a 0.084 unit increase in critical temperature. A one unit increase in range_atomic_radius is associated on average with a 3.007 unit increase in critical temperature. A one unit increase in wtd_std_ThermalConductivity, on the other hand, is associated on average with a 14.559 unit increase in critical temperature. Finally, a one unit increase in wtd_mean_Valence is associated on average with a 0.199 unit decrease in critical temperature. 
+
+Finally, we make predictions on the test set and calculate the RMSE of the baseline model in order to compare it with more complex models.
+
+```{r}
+## Calculating RMSE
+lasso_test_rmse <- 
+  lasso_workflow %>%
+  last_fit(split = data_split) %>%
+  collect_metrics() %>%
+  filter(.metric == "rmse") %>% # test error
+  select(c(".metric", ".estimate"))
+
+print(lasso_test_rmse)
+```
+
+The RMSE of the baseline model is 22.672.
+
+
+# Gradient Descent
+
+We implement gradient descent to fit a Ridge Regression model.
+
+## Ridge Regression using Gradient Descent
+
+We first define two helper functions: the loss function of Ridge regression and the gradient of the loss function. We will use these functions inside the main function of the gradient descent algorithm. 
+
+```{r}
+# Helper functions
+
+## Loss function of Ridge
+ridge_loss = function(X, y, beta, lambda) {
+  # X is a design matrix without the intercept
+  # beta is the estimated coefficients
+  # We assume all the data is centered, as required by Ridge Regression
+  residuals = y - X %*% beta
+  rss = sum(residuals^2) # residual sum of squares
+  penalty = lambda*sum(beta^2) # penalty term with tuning parameter lambda
+  r_loss = rss + penalty # the final ridge loss
+  return(r_loss)
+}
+
+## Gradient of the loss function
+ridge_gradient = function(X, y, beta, lambda) {
+  residuals = y - X %*% beta
+  gradient = -2*t(X)%*%residuals + 2*lambda*beta 
+  return(gradient)
+}
+```
+
+Next, we define the function to implement the gradient descent algorithm for Ridge regression. The function takes as input the features and the response, as well as a lambda value, learning rate, and maximum number of iterations, which we explain inside the function body.
+
+```{r}
+# Gradient Descent Algorithm
+gradient_descent_ridge = function(X, y, 
+                                  lambda, 
+                                  stop_threshold, 
+                                  learning_rate, 
+                                  max_iterations) {
+  # hyperparameters
+  ## lambda: user supplied regularization parameter for ridge regression
+  ## stop_threshold: when the loss doesn't get better than 
+    ### stop_threshold value in consecutive updates the algorithm will stop
+  ## learning rate: how fast the algorithm updates the beta
+  ## max_iterations: maximum number of iterations we allow for
+  
+  # initializing the algorithm
+  beta_init = rnorm(ncol(X), 
+                    mean = 0, 
+                    sd = 0.01) # we initialize beta from a normal distribution
+  loss_beta_init = ridge_loss(X, y, 
+                              beta_init,
+                              lambda) # calculate the loss for initial beta
+  loss_beta_est = 0
+  no_iteration = 0 # we keep track of number of iterations
+  # the training loop, runs until updates are small
+  while ((abs(loss_beta_init - loss_beta_est) > stop_threshold) 
+         && (no_iteration < max_iterations)){
+    current_gradient = ridge_gradient(X, y, beta_init, lambda)
+    
+    # update the previous beta with current gradient
+    beta_est = beta_init - learning_rate * current_gradient
+    
+    # loss with updated beta
+    loss_beta_est = ridge_loss(X, y, beta_est, lambda) 
+    beta_init = beta_est
+    loss_beta_init = loss_beta_est
+    no_iteration = no_iteration + 1
+  }
+  
+  if (no_iteration == max_iterations) {
+    warning("No convergence. Maximum iterations reached.")
+  }
+  return(beta_est)
+}
+```
+
+Finally, we run the function and obtain the Ridge estimates. Note that we experimented with the hyper parameters to find relatively better ones. In gradient descent, the learning rate shouldn't be high relative to the number of iterations in order to allow for convergence to optimal value and prevent overshooting.
+
+```{r}
+# Fitting the model
+
+## Preparing the data
+X = data_train %>% 
+  dplyr::select(-critical_temp) %>% 
+  as.matrix() %>% 
+  scale() # normalize X
+y = data_train$critical_temp %>% 
+  as.matrix()
+
+## Set hyperparameters
+lambda = 100
+stop_threshold = 0.000001
+learning_rate = 0.0000001
+max_iterations = 100000
+
+## Fit the model and get the estimates for beta
+beta_ridge = gradient_descent_ridge(X, y, 
+                                    lambda, 
+                                    stop_threshold, 
+                                    learning_rate, 
+                                    max_iterations)
+
+## Print the estimated coefficients
+print(beta_ridge)
+```
+
+A full interpretation of Ridge estimates is not easy because Ridge keeps every feature in the model. However, we can look at individual coefficients and interpret them the same way we interpret Lasso. It is interesting to note that Lasso estimates from the baseline model and Ridge estimates are quite different. For example, in our Ridge model wtd_entropy_atomic_mass has a coefficient of -0.021 (unlike 0.0837 in Lasso), which suggests that, holding every other variable constant, a unit increase in wtd_entropy_atomic_mass is associated on average with 0.0021 decrease in the critical temperature.
+
+```{r}
+# Manually calculate the test RMSE
+X_test = data_test %>% 
+  dplyr::select(-critical_temp) %>% 
+  as.matrix()
+y_test = data_test$critical_temp %>% 
+  as.matrix()
+
+beta_r = beta_ridge %>% as.matrix()
+
+rmse_ridge_gd = sqrt(mean((y_test - X_test %*% beta_r)^2))
+
+print(rmse_ridge_gd)
+```
+
+We end up with an RMSE of of 129.523, which suggests that Ridge regression might not be the best model to use with our data. There are several very similar features in our dataset, which is why using Lasso to select a subset of predictors instead of using Ridge and keeping every feature might prevent collinearity in our final model and allow for a better test accuracy.
+
+# Relatively Interpretable Non-baseline Model
+
+## Fitting a Decision Tree
+
+```{r}
+# Create the model object
+mod_tree = decision_tree(tree_depth = 8,
+                         # we tune the cost_complexity parameter using CV
+                         cost_complexity = tune("C")) %>% 
+                         set_engine("rpart") %>% 
+                         set_mode("regression")
+
+# Specify the workflow
+workflow_tree = workflow() %>%
+  add_recipe(data_recipe) %>%
+  add_model(mod_tree)
+
+# Fit the model using 10-fold CV to find the optimal cost complexity
+fit_tree = tune_grid(
+  workflow_tree,
+  grid = data.frame(C = 2^(-20:0)), # the grid of C we iterate over
+  data_cv,
+  metrics = yardstick::metric_set(yardstick::rmse)
+)
+
+# Choose the best model
+tree_best = fit_tree %>% select_best("rmse")
+
+# Finalize the model
+tree_final = finalize_model(mod_tree, tree_best)
+
+```
+
+After we choose the optimal cost complexity parameter C using cross validation, we re-fit fit the model to the training data using the chosen C and calculate the test error for the final model.
+
+```{r}
+# Calculate the test error for the final model
+tree_test =
+  workflow_tree %>%
+  update_model(tree_final) %>%
+  last_fit(split = data_split) %>%
+  collect_metrics() %>%
+  filter(.metric == "rmse") %>% # test error
+  select(c(".metric", ".estimate"))
+
+print(tree_test)
+```
+
+RMSE of the tree is 19.859, which is lower than that of baseline model. This is not surprising because a decision tree is able to model interactions and it has more variables to consider as compared to a baseline model with only four predictors.
+
+```{r}
+tree_workflow_fit = workflow() %>%
+   add_recipe(data_recipe) %>%
+   add_model(tree_final) %>%
+   fit(data_train)
+```
+
+
+Using the model fit, we graph the tree and interpret the results.
+
+
+```{r}
+# Graph of the decision tree
+rpart.plot(tree_workflow_fit$fit$fit$fit, 
+           type = 0, # Only label leaves.
+           roundint = FALSE, # Since data used to build the model is no longer available, TRUE gives a warning.
+           fallen.leaves = FALSE, # TRUE to position leaf nodes at the bottom of the graph
+           varlen = 20, # Length of variable names
+           tweak = 1, # Text size adjustment
+           extra = 0) # No extra information displayed (no. of obs etc)
+```
+
+Decision trees are desirable because, even though they might not be the best at predictive accuracy, they are easy to interpret via a decision tree graph. The graph of the tree above shows a splitting rule at each node and the final predicted critical temperatures at the bottom of the tree. For example, let's say we have a chemical at hand, which we don't know the critical temperature of. The tree would predict a critical temperature of 71 for a given chemical if the chemical has range_ThermalConductivity greater than or equal to 400, wtd_range_ElectronAffinity less than 77, wtd_mean_Valence greater than or equal to 2.1, wtd_entropy_ThermalConductivity greater than or equal to 0.76, and std_atomic_mass less than 68. A similar interpretation is possible for other paths along the tree.
+
+Compared to the baseline model, the decision tree has a better predictive accuracy. The type of interpretation we could do is different than that of the baseline model because Lasso yields coefficient estimates, whereas a tree yields paths along which we make "choices" to end up with a predicted critical temperature.
+
+
+# Relatively High Dimensional Model
+
+In order to fit a relatively high dimensional model, we use a GAM framework and increase the effective degrees of freedom so that our model resembles a high dimensional case. We increase the effective degrees of freedom by using the parameter "k" (which is essentially the dimension of the basis used to represent the smooth term), while we are including the smooth terms inside the GAM formula. We try k = 3, 4, 5. Note that fitting a model with k greater than 5 was not possible because then the effective degrees of freedom exceeds the size of the training set.
+
+## Fitting a GAM
+
+```{r}
+# Set up X and Y
+Y_train <- data_train[, 82]
+X_train <- as.matrix(data_train[, -82]) # leave out y
+p <- ncol(X_train)
+n <- nrow(X_train)
+
+# predictors names
+predictors_col_names <- colnames(X_train)
+
+# formula for gam model with different k values k=3,4,5
+formula_1 <- as.formula(paste0("critical_temp ~ ", paste0("s(", predictors_col_names, ", k=", 3,  ", fx=TRUE", ")", collapse = " + ")))
+formula_2 <- as.formula(paste0("critical_temp ~ ", paste0("s(", predictors_col_names, ", k=", 4,  ", fx=TRUE", ")", collapse = " + ")))
+formula_3 <- as.formula(paste0("critical_temp ~ ", paste0("s(", predictors_col_names, ", k=", 5,  ", fx=TRUE", ")", collapse = " + ")))
+
+# create the GAM model object
+mod_gam = gen_additive_mod() |>
+  set_engine("mgcv") |>
+  set_mode("regression")
+
+# fitting GAM models with with different k values
+fit_gam_1 <- mod_gam %>%
+  fit(formula_1,
+      data = data_train) # k = 3
+fit_gam_2 <- mod_gam %>%
+  fit(formula_2,
+      data = data_train) # k = 4
+fit_gam_3 <- mod_gam %>%
+  fit(formula_3,
+      data = data_train) # k = 5
+```
+
+Before calculating the test error, we summarize each fitted model to observe the goodness of fit to the training data.
+
+Even though we don't print out the p-values for the smoothing terms, we observe that in all three models most of the smoothing terms are not significant; however, our purpose with GAMs is not to get the simplest model, so we keep all the features for prediction purposes.
+
+```{r}
+# summary of model with k = 3
+summary_gam_1 = fit_gam_1 %>% pluck('fit') %>% summary() 
+summary_gam_1$dev.expl %>% print()
+```
+
+With k = 3,we have a deviance explained value of 88.0 %. 
+
+```{r}
+# summary of model with k = 4
+summary_gam_2 = fit_gam_2 %>% pluck('fit') %>% summary()
+summary_gam_2$dev.expl %>% print()
+```
+
+With k = 4, we have a deviance explained value of 92.3 %. 
+
+```{r}
+# summary of model with k = 5
+summary_gam_3 = fit_gam_3 %>% pluck('fit') %>% summary()
+summary_gam_3$dev.expl %>% print()
+```
+
+With k = 5, we get a relatively high dimensional model with higher effective degrees of freedom, however its prediction accuracy will likely not be optimal as it over fits to the data, which can be confirmed by the deviance explained value of 97.6%. 
+
+Finally, we make predictions on the test data and measure the prediction performance of the models on our test set. 
+
+```{r}
+# make predictions on test data
+gam_test_1 <- predict(fit_gam_1, new_data = data_test) %>%
+  bind_cols(data_test)
+gam_test_2 <- predict(fit_gam_2, new_data = data_test) %>%
+  bind_cols(data_test)
+gam_test_3 <- predict(fit_gam_3, new_data = data_test) %>%
+  bind_cols(data_test)
+
+# calculate RMSE
+gam_rmse_1 <- gam_test_1 %>%
+  metrics(truth = critical_temp, estimate = .pred) %>%
+  filter(.metric == "rmse") %>%
+  pull(.estimate)
+
+gam_rmse_2 <- gam_test_2 %>%
+  metrics(truth = critical_temp, estimate = .pred) %>%
+  filter(.metric == "rmse") %>%
+  pull(.estimate)
+
+gam_rmse_3 <- gam_test_3 %>%
+  metrics(truth = critical_temp, estimate = .pred) %>%
+  filter(.metric == "rmse") %>%
+  pull(.estimate)
+
+print(paste("RMSE of GAM with k = 3:", round(gam_rmse_1, digit = 3)))
+print(paste("RMSE of GAM with k = 4:", round(gam_rmse_2, digit = 3)))
+print(paste("RMSE of GAM with k = 5:", round(gam_rmse_3, digit = 3)))
+
+```
+
+We get a RMSE of 23.297 for the model with k = 3, 52.123 for the model with k = 4, and 573.188 for the model with k = 5. Even though the over fitting problem, causing a very low bias, explains a part of this huge difference in the test RMSE, another problem we have with k = 5 is that when the effective degrees of freedom is almost the same as the sample size, the model fit becomes unstable due to high variance. In order to find a model that leads to a better fit without giving up the flexibility in at least some of the terms, we will use GAMSEL (Generalized Additive Model Selection), which allows us to fit a penalized generalized additive model.
+
+## Fitting a GAMSEL (Regularized GAM) Model
+
+The function gamsel fits GAMSEL for a path of lambda values and returns a gamsel object. By default, the model is fit for 50 different lambda values. The returned gamsel object contains some useful information on the fitted model. We use degrees of polynomial to be 5 since a higher degree polynomial exceeds the number of unique points in predictor matrix.
+
+```{r}
+# setting degrees of freedom equal to 5 as the high dimensional GAM model
+fit_gamsel <- gamsel(as.matrix(X_train), 
+                     as.matrix(Y_train), 
+                     degree = 5, 
+                     df = 5)
+
+par(mfrow = c(1, 2))
+summary(fit_gamsel, label = TRUE) # include annotations with TRUE
+
+# Comments: 
+# Lambda controls the amount of regularization applied to the model. 
+# Higher values of lambda lead to stronger regularization, which penalizes the 
+# coefficients and helps prevent overfitting by shrinking them towards zero. 
+# Note that by default, the maximum degrees of freedom for 
+# each variable is 5. This can be modified with the dfs option, with larger 
+# values allowing more “wiggly” fits.
+
+```
+
+The gamsel model object tells us how many features, linear components and non-linear components were included in the model for each lambda value respectively. We visualize it using the summary function on the gamsel fit to see the coefficients of the linear features and norms of the non-linear features.
+
+On each plot (one for linear features and one for non-linear features), the x-axis is the lambda value going from large to small. For linear components, the y-axis is the coefficient for each variable while for the nonlinear components and the norm of the nonlinear coefficients. We see that, as lambda gets larger, more coefficients are shrunk towards zero.
+
+We then perform 10-fold cross validation on gamsel in order to choose the optimal lambda.
+
+```{r}
+cv_fit <- cv.gamsel(as.matrix(X_train), 
+                    as.matrix(Y_train), 
+                    degree = 5, 
+                    df = 5, 
+                    nfolds = 10) # number of folds in CV
+plot(cv_fit)
+```
+
+After fitting the cross validated model, we plot the MSE vs log of Lambda. The vertical line on the left represents the lambda corresponding to the minimum CV error we had, while the right vertical dotted line represents lambda.1se, the largest lambda value with CV error within one standard error of the minimum CV error. The numbers at the top represent the number of features included in the final model. We now re-fit the model on the entire training set using the optimal lambda.
+
+```{r}
+# Use the optimal lambda value to refit the GAMSEL model on the entire training dataset
+optimal_lambda <- cv_fit$lambda.min  # or cv_fit$lambda.1se based on your preference
+fit_final <- gamsel(as.matrix(X_train), 
+                    as.matrix(Y_train), 
+                    degree = 5, 
+                    df = 5, 
+                    lambda = c(optimal_lambda))
+```
+
+
+We then evaluate the model on test data to see if we have any improvements as compared to the GAM model.
+
+```{r}
+# Set train and test sets
+X_test <- as.matrix(data_test[, -82])
+Y_test <- as.matrix(data_test[, 82])
+# Obtain predictions
+predictions <- predict(fit_final, newdata = X_test)
+# Calculate RMSE
+rmse_gamsel <- sqrt(mean((predictions - Y_test)^2))
+
+# Comparing accuracy of GAM vs GAMSEL
+rmse_matrix <- data.frame(
+  model = c("Gam 1", "Gam 2", "Gam 3", "Gamsel"),
+  rmse = c(gam_rmse_1, gam_rmse_2, gam_rmse_3, rmse_gamsel))
+
+print(rmse_matrix)
+```
+
+We see that the gamsel model has the lowest RMSE, which suggests that specifying an initial model with high complexity and high effective degrees of freedom and then use a regularization approach (GAMSEL) on it to perform model selection might increase the accuracy of the model.
+
+As a comparison for high dimensional cases (Gam 3 and Gamsel), the gamsel model is preferable because regularization penalises the coefficients, retaining some complexity in the model but also helps preventing overfitting. In terms of predictive accuracy gamsel did much better than the high dimensional gam model.
+
+
+# Model Focused On Predictive Accuracy Without Interpretability
+
+Even though a decision tree is considered interpretable, there are hard-to-interpret tree-based methods that rely on consecutively fitting many trees, which usually results in a higher predictive accuracy. One of such models is Random Forest.
+
+## Fitting a Random Forest Model
+
+We use 10-fold cross validation to choose the optimal number of variables considered at each split of the tree. Number of trees might be considered as a tuning parameter as well; however, 1000 trees is considered a good number as Random Forest doesn't overfit easily.
+
+```{r}
+# Create the RF model object
+mod_rf = 
+  rand_forest(trees = 1000, mtry = tune()) %>% 
+  # mtry (number of variables considered at each split) will be tuned using CV
+  # trees is set to 1000 without tuning because RF doesn't overfit easily
+  set_mode("regression") %>%
+  set_engine("randomForest")
+
+# Specify the workflow
+workflow_rf = workflow() %>%
+  add_recipe(data_recipe) %>%
+  add_model(mod_rf)
+
+# Fit the model using 10-fold CV to find the optimal mtry
+fit_rf = tune_grid(
+  workflow_rf, 
+  data_cv,
+  metrics = yardstick::metric_set(yardstick::rmse)
+)
+
+# Choose the best model in terms of accuracy
+rf_best = fit_rf %>% 
+  select_best()
+
+# Finalize the model
+rf_final = finalize_model(
+  mod_rf, 
+  rf_best)
+
+print(rf_final)
+```
+
+We see that the optimal parameter number of variables considered at each split is chosen to be 29, which is why we refit the model to the whole training set and calculate the test error.
+
+
+```{r}
+# Calculate the test error for the final model
+rf_test = 
+  workflow_rf %>%
+  update_model(rf_final) %>%
+  last_fit(split = data_split) %>%
+  collect_metrics() %>% 
+  filter(.metric == "rmse") %>% # test error
+  select(c(".metric", ".estimate"))
+
+print(rf_test)
+```
+
+A Random Forest model with 1000 trees and 29 variables considered at each split yields a test RMSE of 15.530, which is the lowest among all the models we have used. Considering that our data is heavily subsampled and that the sample size is not very large for a machine learning setting, Random Forest model could have performed much better with a larger sample size because it could capture more complex patterns.
+
+# Conclusion
+
+We fitted five different models: (I) Linear model using Lasso for model selection and estimation, (II) Ridge with gradient descent, (III) Decision tree, (IV) GAMSEL, (V) Random Forest. When we compare the models based on their predictive accuracy, we see that Random Forest is superior, with GAMSEL and Decision Tree being close. All three of these models are able to model non-linear patterns, with two of them (Random Forest and Decision Tree) being able to model interactions as well, which is why their superior performance makes sense.
+
+
+```{r}
+# Comparing accuracy of models
+rmse_matrix <- data.frame(
+  Model = c("Simple Model", 
+            "Ridge with Gradient Descent", 
+            "Decision Tree", 
+            "Gamsel", 
+            "Random Forest"),
+  RMSE = c(lasso_test_rmse$.estimate[1], 
+           rmse_ridge_gd, 
+           tree_test$.estimate[1], 
+           rmse_gamsel, 
+           rf_test$.estimate[1])) %>% 
+  arrange(., RMSE)
+
+print(rmse_matrix)
+```
+
+However, we also saw that, in terms of interpretability, the simple (linear) model is very convenient because one can directly see the associations between features and the outcome. Decision tree is also easy to interpret as it has a natural interpretation via splits based on variables in each node. We note that there methods like variable importance plots, partial dependence plots, and interaction plots exist for Random Forest, but they are hard to use and not informative with 82 features.
+
